@@ -7,7 +7,9 @@ use thiserror::Error;
 pub use combined::CombinedParser;
 
 use crate::reasoning::ReasoningError;
-use crate::tool::{StructuralTagModel, ToolCallDelta, ToolParserError, ToolParserOutput};
+use crate::tool::{
+    StructuralTagModel, ToolCallDelta, ToolParserError, ToolParserEvent, ToolParserOutput,
+};
 
 /// Result alias for unified parser operations.
 pub type Result<T> = std::result::Result<T, UnifiedParserError>;
@@ -49,9 +51,14 @@ impl UnifiedParserOutput {
 
     /// Append parsed tool parser output as unified events.
     pub fn append_tool_output(&mut self, output: ToolParserOutput) {
-        // TODO: make ToolParserOutput carry ordered events and remove this text-first flattening.
-        self.push_text(output.normal_text);
-        self.events.extend(output.calls.into_iter().map(UnifiedParserEvent::ToolCall));
+        for event in output.events {
+            match event {
+                ToolParserEvent::Text(text) => self.push_text(text),
+                ToolParserEvent::ToolCall(call) => {
+                    self.events.push(UnifiedParserEvent::ToolCall(call));
+                }
+            }
+        }
     }
 
     /// Append another parser output onto this one.
