@@ -1,0 +1,182 @@
+name: Build cu129 wheel
+
+# 在 fork 上自动跟踪上游 vllm-project/vllm 的 stable tag。
+# 触发后: 拉取 tag → 应用 PR #38669 (Marlin MoE sm_90 PTX compat) →
+#         Docker 构建 cu129 wheel (pytorch/manylinux2_28-builder:cuda12.9) →
+#         重命名加 +cu129-marlin-fix → 发布到 fork 的 Releases。
+#
+# CUDA arch: 8.0 9.0 (A100 + H100/H200) — 用户选择，缩小 build 范围
+
+on:
+  schedule:
+    - cron: '23 6 * * *'  # 每天 06:23 UTC
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'vllm ref (tag/branch/commit)。默认: 上游最新 stable tag'
+        required: false
+        default: ''
+      force:
+        description: '强制重建 (即使 Release 已存在)'
+        required: false
+        default: 'false'
+
+permissions:
+  contents: write
+
+env:
+  CUDA_ARCH_LIST: "8.0 9.0"
+  PR_NUMBER: "38669"
+  VERSION_LABEL: "cu129-marlin-fix"
+  CUDA_VERSION: "12.9.1"
+  BUILD_BASE_IMAGE: "pytorch/manylinux2_28-builder:cuda12.9"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Resolve vllm ref
+        id: resolve_ref
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          INPUT_REF='${{ inputs.ref }}'
+          if [ -n "$INPUT_REF" ]; then
+            REF="$INPUT_REF"
+          else
+            REF=$(gh api repos/vllm-project/vllm/tags --paginate --jq '.[].name' \
+              | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+              | sort -V \
+              | tail -1)
+            if [ -z "$REF" ]; then
+              echo "Failed to fetch latest stable tag from vllm-project/vllm"
+              exit 1
+            fi
+          fi
+          echo "Resolved ref: $REF"
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+
+      - name: Skip if release already exists
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          REF='${{ steps.resolve_ref.outputs.ref }}'
+          FORCE='${{ inputs.force || 'false' }}'
+          VER="${REF#v}"
+          TAG="vllm-v${VER}+${VERSION_LABEL}"
+          if [ "$FORCE" = "true" ]; then
+            echo "Force rebuild requested"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          elif gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists, skipping"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Release $TAG does not exist, will build"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Free disk space
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          df -h /
+          # Remove unused software to free up space for Docker build
+          sudo rm -rf /usr/local/.ghcup /usr/local/lib/node_modules /opt/ghc /usr/local/share/ghcup /opt/ghcabic 2>/dev/null || true
+          sudo apt-get clean
+          docker system prune -af --volumes 2>/dev/null || true
+          df -h /
+
+      - name: Checkout vllm at ${{ steps.resolve_ref.outputs.ref }}
+        if: steps.check.outputs.skip != 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: vllm-project/vllm
+          ref: ${{ steps.resolve_ref.outputs.ref }}
+          fetch-depth: 1
+
+      - name: Apply PR #${{ env.PR_NUMBER }} (Marlin MoE sm_90 PTX compat)
+        if: steps.check.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr diff ${PR_NUMBER} -R vllm-project/vllm > /tmp/pr.patch
+          echo "==== patch summary (first 30 lines) ===="
+          head -30 /tmp/pr.patch
+          echo "==== applying ===="
+          git apply --verbose /tmp/pr.patch
+          echo "==== changed files ===="
+          git status --short
+
+      - name: Build wheel via Docker
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          set -euxo pipefail
+          DOCKER_BUILDKIT=1 docker build \
+            --build-arg max_jobs=4 \
+            --build-arg USE_SCCACHE=0 \
+            --build-arg GIT_REPO_CHECK=1 \
+            --build-arg CUDA_VERSION=${CUDA_VERSION} \
+            --build-arg torch_cuda_arch_list="${CUDA_ARCH_LIST}" \
+            --build-arg BUILD_OS=manylinux \
+            --build-arg BUILD_BASE_IMAGE=${BUILD_BASE_IMAGE} \
+            --tag vllm-ci:build-image \
+            --target build \
+            -f docker/Dockerfile .
+
+          mkdir -p artifacts
+          docker run --rm -v "$(pwd)/artifacts:/artifacts_host" vllm-ci:build-image \
+            bash -c 'cp -r dist /artifacts_host && chmod -R a+rw /artifacts_host'
+
+          echo "==== built wheels ===="
+          ls -lh artifacts/dist/
+
+      - name: Tag wheel with +${{ env.VERSION_LABEL }}
+        if: steps.check.outputs.skip != 'true'
+        id: rename
+        working-directory: artifacts/dist
+        run: |
+          set -euo pipefail
+          WHEEL=$(ls vllm-*.whl | head -n1)
+          LABEL='${{ env.VERSION_LABEL }}'
+          # e.g. vllm-0.26.0-cp312-cp312-manylinux_2_28_x86_64.whl -> vllm-0.26.0+cu129-marlin-fix-cp312-...
+          NEW=$(printf '%s' "$WHEEL" | sed -E "s|^(vllm-[0-9]+\.[0-9]+\.[0-9]+)-|\1+${LABEL}-|")
+          mv "$WHEEL" "$NEW"
+          echo "renamed=$NEW" >> "$GITHUB_OUTPUT"
+          ls -lh "$NEW"
+
+      - name: Resolve version
+        if: steps.check.outputs.skip != 'true'
+        id: ver
+        run: |
+          W='${{ steps.rename.outputs.renamed }}'
+          V=$(printf '%s' "$W" | sed -E 's|^vllm-||; s|\.whl$||; s|-cp[0-9]+.*||; s|-py3.*||')
+          printf 'version=%s\n' "$V" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: $V"
+
+      - name: Create GitHub Release
+        if: steps.check.outputs.skip != 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: vllm-v${{ steps.ver.outputs.version }}
+          name: vllm ${{ steps.ver.outputs.version }}
+          body: |
+            vllm wheel built from upstream `${{ steps.resolve_ref.outputs.ref }}` + PR #${{ env.PR_NUMBER }} (Marlin MoE sm_90 PTX compat fix).
+
+            Built with CUDA `${{ env.CUDA_VERSION }}`, arch list: `${{ env.CUDA_ARCH_LIST }}`.
+
+            ## Install
+
+            ```bash
+            pip install --no-deps --force-reinstall <WHEEL_URL>
+            ```
+
+            Use `--no-deps` to preserve your existing CUDA 12.9 vllm deps (torch, etc.). Then install any missing deps from PyPI or your cu129 wheel sources.
+          files: artifacts/dist/${{ steps.rename.outputs.renamed }}
+          fail_on_unmatched_files: true
+          make_latest: false
+
+      - name: Cleanup Docker
+        if: always()
+        run: |
+          docker system prune -af --volumes 2>&1 || true
