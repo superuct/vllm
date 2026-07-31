@@ -1,11 +1,7 @@
 name: Build cu129 wheel
 
-# 在 self-hosted runner (cu129-builder) 上原生构建 vllm cu129 wheel。
-# 服务器：hadoop-hmart-fsp-ml@10.24.171.203，16 核 64GB RAM + 50GB 盘，
-# 已装 CUDA 12.9 toolkit (/usr/local/cuda-12.9)，通过 corp proxy 联网。
-#
-# 流程：拉 tag → 应用 PR #38669 → 用 venv 装 torch cu129 + 构建依赖 →
-#       pip wheel 原生编译 CUDA → 重命名加 +cu129-marlin-fix → 发布 Release
+# 在 GitHub 托管 runner 中通过 CUDA 12.9 Docker 镜像构建 wheel。
+# 流程：拉 tag → 应用 PR #38669 → Docker 原生编译 CUDA → 发布 Release。
 
 on:
   schedule:
@@ -28,25 +24,23 @@ env:
   CUDA_ARCH_LIST: "8.0 9.0"
   PR_NUMBER: "38669"
   VERSION_LABEL: "cu129-marlin-fix"
-  CUDA_VERSION: "12.9"
-  HTTPS_PROXY: http://11.44.127.31:8420
-  HTTP_PROXY: http://11.44.127.31:8420
-  NO_PROXY: localhost,127.0.0.1,.svc.cluster.local,.sankuai.com
-  CUDA_HOME: /usr/local/cuda-12.9
-  PIP_INDEX_URL: https://pypi.mirrors.ustc.edu.cn/simple/
-  PIP_TRUSTED_HOST: pypi.mirrors.ustc.edu.cn
+  CUDA_VERSION: "12.9.1"
+  BUILD_BASE_IMAGE: "pytorch/manylinux2_28-builder:cuda12.9"
+
+concurrency:
+  group: cu129-wheel-${{ inputs.ref || 'latest-stable' }}
+  # 手动重试不能中止已在编译的任务；同版本任务依次执行。
+  cancel-in-progress: false
 
 jobs:
   build:
-    runs-on: [self-hosted, cu129-builder]
-    timeout-minutes: 240
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
     steps:
       - name: Resolve vllm ref
         id: resolve_ref
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          https_proxy: ${{ env.HTTPS_PROXY }}
-          http_proxy: ${{ env.HTTP_PROXY }}
         run: |
           INPUT_REF='${{ inputs.ref }}'
           if [ -n "$INPUT_REF" ]; then
@@ -68,8 +62,6 @@ jobs:
         id: check
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          https_proxy: ${{ env.HTTPS_PROXY }}
-          http_proxy: ${{ env.HTTP_PROXY }}
         run: |
           REF='${{ steps.resolve_ref.outputs.ref }}'
           FORCE='${{ inputs.force || 'false' }}'
@@ -86,6 +78,19 @@ jobs:
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Free disk space
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/.ghcup /usr/local/lib/node_modules /opt/ghc /usr/local/share/ghcup 2>/dev/null || true
+          sudo apt-get clean
+          docker system prune -af --volumes 2>/dev/null || true
+          df -h /
+
+      - name: Set up Docker Buildx
+        if: steps.check.outputs.skip != 'true'
+        uses: docker/setup-buildx-action@v3
+
       - name: Checkout vllm at ${{ steps.resolve_ref.outputs.ref }}
         if: steps.check.outputs.skip != 'true'
         uses: actions/checkout@v4
@@ -98,8 +103,6 @@ jobs:
         if: steps.check.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          https_proxy: ${{ env.HTTPS_PROXY }}
-          http_proxy: ${{ env.HTTP_PROXY }}
         run: |
           gh pr diff ${PR_NUMBER} -R vllm-project/vllm > /tmp/pr.patch
           echo "==== patch summary (first 30 lines) ===="
@@ -109,44 +112,33 @@ jobs:
           echo "==== changed files ===="
           git status --short
 
-      - name: Set up build venv (cached on runner)
+      - name: Build wheel via Docker
         if: steps.check.outputs.skip != 'true'
         run: |
-          VENV_DIR="$HOME/vllm-build-venv"
-          if [ ! -d "$VENV_DIR" ]; then
-            echo "Creating venv at $VENV_DIR"
-            python3 -m venv "$VENV_DIR"
-          fi
-          source "$VENV_DIR/bin/activate"
-          python -m pip install --upgrade pip
-          # Build deps
-          pip install cmake ninja wheel setuptools setuptools-scm uv
-          # torch cu129 (PyTorch official index)
-          pip install --index-url https://download.pytorch.org/whl/cu129 torch==2.11.0
-          echo "VENV_DIR=$VENV_DIR" >> "$GITHUB_ENV"
-
-      - name: Build wheel (native, no Docker)
-        if: steps.check.outputs.skip != 'true'
-        env:
-          CUDA_HOME: ${{ env.CUDA_HOME }}
-          TORCH_CUDA_ARCH_LIST: ${{ env.CUDA_ARCH_LIST }}
-          MAX_JOBS: "8"
-          PATH: ${{ env.CUDA_HOME }}/bin:/usr/bin:/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin
-          LD_LIBRARY_PATH: ${{ env.CUDA_HOME }}/lib64
-        run: |
-          source "$VENV_DIR/bin/activate"
-          # Sanity: nvcc available
-          which nvcc && nvcc --version | head -3
-          # Build wheel in dist/
-          rm -rf dist build
-          python -m pip wheel . --no-build-isolation -w dist/
+          set -euxo pipefail
+          docker buildx build --load \
+            --cache-from type=gha \
+            --cache-to type=gha,mode=max \
+            --build-arg max_jobs=4 \
+            --build-arg USE_SCCACHE=0 \
+            --build-arg GIT_REPO_CHECK=1 \
+            --build-arg CUDA_VERSION=${CUDA_VERSION} \
+            --build-arg torch_cuda_arch_list="${CUDA_ARCH_LIST}" \
+            --build-arg BUILD_OS=manylinux \
+            --build-arg BUILD_BASE_IMAGE=${BUILD_BASE_IMAGE} \
+            --tag vllm-ci:build-image \
+            --target build \
+            -f docker/Dockerfile .
+          mkdir -p artifacts
+          docker run --rm -v "$(pwd)/artifacts:/artifacts_host" vllm-ci:build-image \
+            bash -c 'cp -r dist /artifacts_host && chmod -R a+rw /artifacts_host'
           echo "==== built wheels ===="
-          ls -lh dist/
+          ls -lh artifacts/dist/
 
       - name: Tag wheel with +${{ env.VERSION_LABEL }}
         if: steps.check.outputs.skip != 'true'
         id: rename
-        working-directory: dist
+        working-directory: artifacts/dist
         run: |
           set -euo pipefail
           WHEEL=$(ls vllm-*.whl | head -n1)
@@ -183,6 +175,6 @@ jobs:
             ```
 
             Use `--no-deps` to preserve your existing CUDA 12.9 vllm deps (torch, etc.).
-          files: dist/${{ steps.rename.outputs.renamed }}
+          files: artifacts/dist/${{ steps.rename.outputs.renamed }}
           fail_on_unmatched_files: true
           make_latest: false
