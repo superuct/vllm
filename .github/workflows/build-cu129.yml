@@ -16,21 +16,23 @@ on:
         description: '强制重建 (即使 Release 已存在)'
         required: false
         default: 'false'
+      arch_list:
+        description: 'CUDA arch list，默认 8.0 9.0；H100/H200 可填 9.0'
+        required: false
+        default: '8.0 9.0'
 
 permissions:
   contents: write
 
 env:
-  CUDA_ARCH_LIST: "8.0 9.0"
+  CUDA_ARCH_LIST: ${{ inputs.arch_list || '8.0 9.0' }}
   PR_NUMBER: "38669"
   VERSION_LABEL: "cu129-marlin-fix"
   CUDA_VERSION: "12.9.1"
   BUILD_BASE_IMAGE: "pytorch/manylinux2_28-builder:cuda12.9"
 
 concurrency:
-  # Versioned while retiring the pre-split workflow run; future edits should
-  # keep one stable group per ref once the old run has terminated.
-  group: cu129-wheel-v2-${{ inputs.ref || 'latest-stable' }}
+  group: cu129-wheel-${{ inputs.ref || 'latest-stable' }}
   # 手动重试不能中止已在编译的任务；同版本任务依次执行。
   cancel-in-progress: false
 
@@ -127,15 +129,31 @@ jobs:
           git apply --verbose /tmp/pr.patch
           git status --short
 
+      - name: Use Release CMake build type
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          dockerfile = Path("docker/Dockerfile")
+          text = dockerfile.read_text()
+          marker = "FROM base AS csrc-build\n"
+          injection = marker + "ENV CMAKE_BUILD_TYPE=Release\n"
+          if "ENV CMAKE_BUILD_TYPE=Release" not in text:
+              if marker not in text:
+                  raise SystemExit("csrc-build stage not found in docker/Dockerfile")
+              dockerfile.write_text(text.replace(marker, injection, 1))
+          PY
+
       - name: Build C++/CUDA extension wheel and export cache
         run: |
           set -euxo pipefail
-          # setup.py divides MAX_JOBS by NVCC_THREADS. The Dockerfile default
-          # is 8, so max_jobs=4 otherwise degenerates to one Ninja job.
+          # Keep two nvcc processes on the 4-core/16-GB hosted runner. Four
+          # concurrent template-heavy nvcc jobs repeatedly caused runner exit
+          # 143 before the cache could be exported.
           docker buildx build --progress=plain \
             --cache-from "type=gha,scope=${CACHE_SCOPE}-csrc" \
             --cache-to "type=gha,scope=${CACHE_SCOPE}-csrc,mode=max" \
-            --build-arg max_jobs=4 \
+            --build-arg max_jobs=2 \
             --build-arg nvcc_threads=1 \
             --build-arg USE_SCCACHE=0 \
             --build-arg CUDA_VERSION=${CUDA_VERSION} \
@@ -181,6 +199,21 @@ jobs:
           git apply --verbose /tmp/pr.patch
           git status --short
 
+      - name: Use Release CMake build type
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          dockerfile = Path("docker/Dockerfile")
+          text = dockerfile.read_text()
+          marker = "FROM base AS csrc-build\n"
+          injection = marker + "ENV CMAKE_BUILD_TYPE=Release\n"
+          if "ENV CMAKE_BUILD_TYPE=Release" not in text:
+              if marker not in text:
+                  raise SystemExit("csrc-build stage not found in docker/Dockerfile")
+              dockerfile.write_text(text.replace(marker, injection, 1))
+          PY
+
       - name: Build wheel via Docker using the csrc cache
         run: |
           set -euxo pipefail
@@ -188,7 +221,7 @@ jobs:
             --cache-from "type=gha,scope=${CACHE_SCOPE}-csrc" \
             --cache-from "type=gha,scope=${CACHE_SCOPE}-package" \
             --cache-to "type=gha,scope=${CACHE_SCOPE}-package,mode=max" \
-            --build-arg max_jobs=4 \
+            --build-arg max_jobs=2 \
             --build-arg nvcc_threads=1 \
             --build-arg USE_SCCACHE=0 \
             --build-arg GIT_REPO_CHECK=1 \
