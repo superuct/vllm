@@ -33,9 +33,13 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build:
+  prepare:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 10
+    outputs:
+      ref: ${{ steps.resolve_ref.outputs.ref }}
+      skip: ${{ steps.check.outputs.skip }}
+      cache_scope: ${{ steps.cache_scope.outputs.scope }}
     steps:
       - name: Resolve vllm ref
         id: resolve_ref
@@ -78,8 +82,24 @@ jobs:
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Compute BuildKit cache scope
+        id: cache_scope
+        run: |
+          REF='${{ steps.resolve_ref.outputs.ref }}'
+          SAFE_REF=$(printf '%s' "$REF" | tr '/:' '--')
+          echo "scope=cu129-vllm-${SAFE_REF}" >> "$GITHUB_OUTPUT"
+
+  build-csrc:
+    needs: prepare
+    if: needs.prepare.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    # Keep this below GitHub-hosted runner's six-hour hard limit.
+    timeout-minutes: 350
+    env:
+      REF: ${{ needs.prepare.outputs.ref }}
+      CACHE_SCOPE: ${{ needs.prepare.outputs.cache_scope }}
+    steps:
       - name: Free disk space
-        if: steps.check.outputs.skip != 'true'
         run: |
           df -h /
           sudo rm -rf /usr/local/.ghcup /usr/local/lib/node_modules /opt/ghc /usr/local/share/ghcup 2>/dev/null || true
@@ -88,38 +108,86 @@ jobs:
           df -h /
 
       - name: Set up Docker Buildx
-        if: steps.check.outputs.skip != 'true'
         uses: docker/setup-buildx-action@v3
 
-      - name: Checkout vllm at ${{ steps.resolve_ref.outputs.ref }}
-        if: steps.check.outputs.skip != 'true'
+      - name: Checkout vllm at ${{ needs.prepare.outputs.ref }}
         uses: actions/checkout@v4
         with:
           repository: vllm-project/vllm
-          ref: ${{ steps.resolve_ref.outputs.ref }}
+          ref: ${{ needs.prepare.outputs.ref }}
           fetch-depth: 1
 
       - name: Apply PR #${{ env.PR_NUMBER }} (Marlin MoE sm_90 PTX compat)
-        if: steps.check.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh pr diff ${PR_NUMBER} -R vllm-project/vllm > /tmp/pr.patch
-          echo "==== patch summary (first 30 lines) ===="
-          head -30 /tmp/pr.patch
-          echo "==== applying ===="
           git apply --verbose /tmp/pr.patch
-          echo "==== changed files ===="
           git status --short
 
-      - name: Build wheel via Docker
-        if: steps.check.outputs.skip != 'true'
+      - name: Build C++/CUDA extension wheel and export cache
         run: |
           set -euxo pipefail
-          docker buildx build --load \
-            --cache-from type=gha \
-            --cache-to type=gha,mode=max \
+          # setup.py divides MAX_JOBS by NVCC_THREADS. The Dockerfile default
+          # is 8, so max_jobs=4 otherwise degenerates to one Ninja job.
+          docker buildx build --progress=plain \
+            --cache-from "type=gha,scope=${CACHE_SCOPE}-csrc" \
+            --cache-to "type=gha,scope=${CACHE_SCOPE}-csrc,mode=max" \
             --build-arg max_jobs=4 \
+            --build-arg nvcc_threads=1 \
+            --build-arg USE_SCCACHE=0 \
+            --build-arg CUDA_VERSION=${CUDA_VERSION} \
+            --build-arg torch_cuda_arch_list="${CUDA_ARCH_LIST}" \
+            --build-arg BUILD_OS=manylinux \
+            --build-arg BUILD_BASE_IMAGE=${BUILD_BASE_IMAGE} \
+            --target csrc-build \
+            --tag vllm-ci:csrc \
+            -f docker/Dockerfile .
+
+  package:
+    needs: [prepare, build-csrc]
+    if: needs.prepare.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      REF: ${{ needs.prepare.outputs.ref }}
+      CACHE_SCOPE: ${{ needs.prepare.outputs.cache_scope }}
+    steps:
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/.ghcup /usr/local/lib/node_modules /opt/ghc /usr/local/share/ghcup 2>/dev/null || true
+          sudo apt-get clean
+          docker system prune -af --volumes 2>/dev/null || true
+          df -h /
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Checkout vllm at ${{ needs.prepare.outputs.ref }}
+        uses: actions/checkout@v4
+        with:
+          repository: vllm-project/vllm
+          ref: ${{ needs.prepare.outputs.ref }}
+          fetch-depth: 1
+
+      - name: Apply PR #${{ env.PR_NUMBER }} (Marlin MoE sm_90 PTX compat)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr diff ${PR_NUMBER} -R vllm-project/vllm > /tmp/pr.patch
+          git apply --verbose /tmp/pr.patch
+          git status --short
+
+      - name: Build wheel via Docker using the csrc cache
+        run: |
+          set -euxo pipefail
+          docker buildx build --progress=plain --load \
+            --cache-from "type=gha,scope=${CACHE_SCOPE}-csrc" \
+            --cache-from "type=gha,scope=${CACHE_SCOPE}-package" \
+            --cache-to "type=gha,scope=${CACHE_SCOPE}-package,mode=max" \
+            --build-arg max_jobs=4 \
+            --build-arg nvcc_threads=1 \
             --build-arg USE_SCCACHE=0 \
             --build-arg GIT_REPO_CHECK=1 \
             --build-arg CUDA_VERSION=${CUDA_VERSION} \
@@ -136,7 +204,6 @@ jobs:
           ls -lh artifacts/dist/
 
       - name: Tag wheel with +${{ env.VERSION_LABEL }}
-        if: steps.check.outputs.skip != 'true'
         id: rename
         working-directory: artifacts/dist
         run: |
@@ -149,7 +216,6 @@ jobs:
           ls -lh "$NEW"
 
       - name: Resolve version
-        if: steps.check.outputs.skip != 'true'
         id: ver
         run: |
           W='${{ steps.rename.outputs.renamed }}'
@@ -158,15 +224,14 @@ jobs:
           echo "Resolved version: $V"
 
       - name: Create GitHub Release
-        if: steps.check.outputs.skip != 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: vllm-v${{ steps.ver.outputs.version }}
           name: vllm ${{ steps.ver.outputs.version }}
           body: |
-            vllm wheel built from upstream `${{ steps.resolve_ref.outputs.ref }}` + PR #${{ env.PR_NUMBER }} (Marlin MoE sm_90 PTX compat fix).
+            vllm wheel built from upstream `${{ needs.prepare.outputs.ref }}` + PR #${{ env.PR_NUMBER }} (Marlin MoE sm_90 PTX compat fix).
 
-            Built natively on self-hosted runner (CUDA ${{ env.CUDA_VERSION }}, arch list: `${{ env.CUDA_ARCH_LIST }}`).
+            Built on GitHub-hosted runners in two stages: C++/CUDA extensions are cached first, then the final wheel is packaged (CUDA ${{ env.CUDA_VERSION }}, arch list: `${{ env.CUDA_ARCH_LIST }}`).
 
             ## Install
 
