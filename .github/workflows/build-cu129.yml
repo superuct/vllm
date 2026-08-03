@@ -28,7 +28,9 @@ env:
   BUILD_BASE_IMAGE: "pytorch/manylinux2_28-builder:cuda12.9"
 
 concurrency:
-  group: cu129-wheel-${{ inputs.ref || 'latest-stable' }}
+  # Versioned while retiring the pre-split workflow run; future edits should
+  # keep one stable group per ref once the old run has terminated.
+  group: cu129-wheel-v2-${{ inputs.ref || 'latest-stable' }}
   # 手动重试不能中止已在编译的任务；同版本任务依次执行。
   cancel-in-progress: false
 
