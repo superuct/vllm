@@ -17,15 +17,15 @@ on:
         required: false
         default: 'false'
       arch_list:
-        description: 'CUDA arch list，默认 8.0 9.0；H100/H200 可填 9.0'
+        description: 'CUDA arch list，默认 9.0（H100/H200）；需要 Ampere 时填 8.0 9.0'
         required: false
-        default: '8.0 9.0'
+        default: '9.0'
 
 permissions:
   contents: write
 
 env:
-  CUDA_ARCH_LIST: ${{ inputs.arch_list || '8.0 9.0' }}
+  CUDA_ARCH_LIST: ${{ inputs.arch_list || '9.0' }}
   PR_NUMBER: "38669"
   VERSION_LABEL: "cu129-marlin-fix"
   CUDA_VERSION: "12.9.1"
@@ -164,13 +164,13 @@ jobs:
       - name: Build C++/CUDA extension wheel and export cache
         run: |
           set -euxo pipefail
-          # Keep three nvcc processes on the 4-core/16-GB hosted runner. Four
-          # concurrent template-heavy nvcc jobs repeatedly caused runner exit
-          # 143; two processes avoided that peak but exceeded the job budget.
+          # Keep two nvcc processes on the 4-core/16-GB hosted runner. Three
+          # concurrent template-heavy nvcc jobs lost runner communication;
+          # the previous two-way build reached wheel creation in about 5h06m.
           docker buildx build --progress=plain \
             --cache-from "type=gha,scope=${CACHE_SCOPE}-csrc" \
             --cache-to "type=gha,scope=${CACHE_SCOPE}-csrc,mode=min" \
-            --build-arg max_jobs=3 \
+            --build-arg max_jobs=2 \
             --build-arg nvcc_threads=1 \
             --build-arg USE_SCCACHE=0 \
             --build-arg CUDA_VERSION=${CUDA_VERSION} \
@@ -250,7 +250,7 @@ jobs:
             --cache-from "type=gha,scope=${CACHE_SCOPE}-csrc" \
             --cache-from "type=gha,scope=${CACHE_SCOPE}-package" \
             --cache-to "type=gha,scope=${CACHE_SCOPE}-package,mode=max" \
-            --build-arg max_jobs=3 \
+            --build-arg max_jobs=2 \
             --build-arg nvcc_threads=1 \
             --build-arg USE_SCCACHE=0 \
             --build-arg GIT_REPO_CHECK=1 \
