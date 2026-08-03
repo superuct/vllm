@@ -215,10 +215,100 @@ jobs:
           echo "renamed=$NEW" >> "$GITHUB_OUTPUT"
           ls -lh "$NEW"
 
+      - name: Update wheel metadata for the local version
+        id: metadata
+        working-directory: artifacts/dist
+        env:
+          WHEEL: ${{ steps.rename.outputs.renamed }}
+          LABEL: ${{ env.VERSION_LABEL }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64
+          import hashlib
+          import os
+          import re
+          import shutil
+          import tempfile
+          import zipfile
+          from pathlib import Path
+
+          source = Path(os.environ["WHEEL"])
+          label = os.environ["LABEL"]
+          stem = source.stem
+          marker = stem.find("-cp")
+          if marker < 0:
+              raise SystemExit(f"cannot parse wheel tags: {source.name}")
+          version = stem[len("vllm-"):marker]
+          tags = stem[marker + 1:]
+          base_version = version.split("+", 1)[0]
+          new_version = f"{base_version}+{label}"
+          new_name = f"vllm-{new_version}-{tags}.whl"
+
+          with tempfile.TemporaryDirectory() as temp_dir:
+              root = Path(temp_dir)
+              with zipfile.ZipFile(source) as archive:
+                  archive.extractall(root)
+
+              dist_infos = list(root.glob("vllm-*.dist-info"))
+              if len(dist_infos) != 1:
+                  raise SystemExit(f"expected one dist-info directory, got {dist_infos}")
+              old_dist_info = dist_infos[0]
+              new_dist_info = root / f"vllm-{new_version}.dist-info"
+              old_dist_info.rename(new_dist_info)
+
+              metadata_path = new_dist_info / "METADATA"
+              metadata = metadata_path.read_text()
+              metadata, count = re.subn(
+                  r"(?m)^Version: .*?$",
+                  f"Version: {new_version}",
+                  metadata,
+                  count=1,
+              )
+              if count != 1:
+                  raise SystemExit("Version field not found in wheel METADATA")
+              metadata_path.write_text(metadata)
+
+              record_path = new_dist_info / "RECORD"
+              record_rel = record_path.relative_to(root).as_posix()
+              rows = []
+              for file_path in sorted(root.rglob("*")):
+                  if not file_path.is_file():
+                      continue
+                  relative = file_path.relative_to(root).as_posix()
+                  if relative == record_rel:
+                      continue
+                  digest = base64.urlsafe_b64encode(
+                      hashlib.sha256(file_path.read_bytes()).digest()
+                  ).decode().rstrip("=")
+                  rows.append(f"{relative},sha256={digest},{file_path.stat().st_size}")
+              rows.append(f"{record_rel},,")
+              record_path.write_text("\n".join(rows) + "\n")
+
+              output = root.parent / new_name
+              with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                  for file_path in sorted(root.rglob("*")):
+                      if file_path.is_file():
+                          archive.write(file_path, file_path.relative_to(root).as_posix())
+              shutil.move(output, source)
+
+          final_path = source.with_name(new_name)
+          source.rename(final_path)
+          print(f"normalized wheel: {final_path.name}")
+          with final_path.open("rb") as archive_file:
+              with zipfile.ZipFile(archive_file) as archive:
+                  metadata_name = next(name for name in archive.namelist() if name.endswith(".dist-info/METADATA"))
+                  metadata = archive.read(metadata_name).decode()
+                  if f"Version: {new_version}" not in metadata:
+                      raise SystemExit("normalized METADATA version check failed")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output_file:
+              output_file.write(f"wheel={final_path.name}\n")
+          PY
+
       - name: Resolve version
         id: ver
         run: |
-          W='${{ steps.rename.outputs.renamed }}'
+          W='${{ steps.metadata.outputs.wheel }}'
           V=$(printf '%s' "$W" | sed -E 's|^vllm-||; s|\.whl$||; s|-cp[0-9]+.*||; s|-py3.*||')
           printf 'version=%s\n' "$V" >> "$GITHUB_OUTPUT"
           echo "Resolved version: $V"
@@ -240,6 +330,6 @@ jobs:
             ```
 
             Use `--no-deps` to preserve your existing CUDA 12.9 vllm deps (torch, etc.).
-          files: artifacts/dist/${{ steps.rename.outputs.renamed }}
+          files: artifacts/dist/${{ steps.metadata.outputs.wheel }}
           fail_on_unmatched_files: true
           make_latest: false
