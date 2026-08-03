@@ -164,13 +164,13 @@ jobs:
       - name: Build C++/CUDA extension wheel and export cache
         run: |
           set -euxo pipefail
-          # Keep two nvcc processes on the 4-core/16-GB hosted runner. Four
+          # Keep three nvcc processes on the 4-core/16-GB hosted runner. Four
           # concurrent template-heavy nvcc jobs repeatedly caused runner exit
-          # 143 before the cache could be exported.
+          # 143; two processes avoided that peak but exceeded the job budget.
           docker buildx build --progress=plain \
             --cache-from "type=gha,scope=${CACHE_SCOPE}-csrc" \
-            --cache-to "type=gha,scope=${CACHE_SCOPE}-csrc,mode=max" \
-            --build-arg max_jobs=2 \
+            --cache-to "type=gha,scope=${CACHE_SCOPE}-csrc,mode=min" \
+            --build-arg max_jobs=3 \
             --build-arg nvcc_threads=1 \
             --build-arg USE_SCCACHE=0 \
             --build-arg CUDA_VERSION=${CUDA_VERSION} \
@@ -250,7 +250,7 @@ jobs:
             --cache-from "type=gha,scope=${CACHE_SCOPE}-csrc" \
             --cache-from "type=gha,scope=${CACHE_SCOPE}-package" \
             --cache-to "type=gha,scope=${CACHE_SCOPE}-package,mode=max" \
-            --build-arg max_jobs=2 \
+            --build-arg max_jobs=3 \
             --build-arg nvcc_threads=1 \
             --build-arg USE_SCCACHE=0 \
             --build-arg GIT_REPO_CHECK=1 \
