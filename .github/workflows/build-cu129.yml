@@ -129,7 +129,7 @@ jobs:
           git apply --verbose /tmp/pr.patch
           git status --short
 
-      - name: Use Release CMake build type
+      - name: Use Release CMake build type and skip Machete on hosted runner
         run: |
           python3 - <<'PY'
           from pathlib import Path
@@ -142,6 +142,23 @@ jobs:
               if marker not in text:
                   raise SystemExit("csrc-build stage not found in docker/Dockerfile")
               dockerfile.write_text(text.replace(marker, injection, 1))
+
+          # Machete's generated Hopper dispatch translation unit is the first
+          # template-heavy CUDA target on the 4-core/16-GB hosted runner. It
+          # repeatedly receives SIGTERM around [37/421] before the csrc cache
+          # can be exported. Marlin (including PR #38669's native sm_90/PTX
+          # fix) remains enabled; vLLM falls back when Machete is unavailable.
+          cmake = Path("CMakeLists.txt")
+          text = cmake.read_text()
+          marker = '    cuda_archs_loose_intersection(MACHETE_ARCHS "9.0a" "${CUDA_ARCHS}")'
+          replacement = (
+              "    # Hosted cu129 builds skip generated Machete kernels to stay "
+              "within the runner memory limit.\n"
+              "    set(MACHETE_ARCHS)"
+          )
+          if marker not in text:
+              raise SystemExit("MACHETE_ARCHS declaration not found")
+          cmake.write_text(text.replace(marker, replacement, 1))
           PY
 
       - name: Build C++/CUDA extension wheel and export cache
@@ -199,7 +216,7 @@ jobs:
           git apply --verbose /tmp/pr.patch
           git status --short
 
-      - name: Use Release CMake build type
+      - name: Use Release CMake build type and skip Machete on hosted runner
         run: |
           python3 - <<'PY'
           from pathlib import Path
@@ -212,6 +229,18 @@ jobs:
               if marker not in text:
                   raise SystemExit("csrc-build stage not found in docker/Dockerfile")
               dockerfile.write_text(text.replace(marker, injection, 1))
+
+          cmake = Path("CMakeLists.txt")
+          text = cmake.read_text()
+          marker = '    cuda_archs_loose_intersection(MACHETE_ARCHS "9.0a" "${CUDA_ARCHS}")'
+          replacement = (
+              "    # Hosted cu129 builds skip generated Machete kernels to stay "
+              "within the runner memory limit.\n"
+              "    set(MACHETE_ARCHS)"
+          )
+          if marker not in text:
+              raise SystemExit("MACHETE_ARCHS declaration not found")
+          cmake.write_text(text.replace(marker, replacement, 1))
           PY
 
       - name: Build wheel via Docker using the csrc cache
