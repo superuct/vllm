@@ -1,7 +1,7 @@
 name: Build cu129 wheel
 
-# 在 GitHub 托管 runner 中通过 CUDA 12.9 Docker 镜像构建 wheel。
-# 流程：拉 tag → 应用 PR #38669 → Docker 原生编译 CUDA → 发布 Release。
+# 在 GitHub 托管 runner 中通过 CUDA 12.9 Docker 镜像编译 native csrc。
+# 流程：拉 tag → 应用 PR #38669 → Docker 编译 csrc → 合并官方 cu129 Python wheel → 发布 Release。
 
 on:
   schedule:
@@ -16,12 +16,17 @@ on:
         description: '强制重建 (即使 Release 已存在)'
         required: false
         default: 'false'
+      reuse_csrc_run:
+        description: '仅手动验证打包时复用已有 run 的 csrc artifact；留空则完整构建'
+        required: false
+        default: ''
       arch_list:
         description: 'CUDA arch list，默认 9.0（H100/H200）；需要 Ampere 时填 8.0 9.0'
         required: false
         default: '9.0'
 
 permissions:
+  actions: read
   contents: write
 
 env:
@@ -95,7 +100,7 @@ jobs:
 
   build-csrc:
     needs: prepare
-    if: needs.prepare.outputs.skip != 'true'
+    if: needs.prepare.outputs.skip != 'true' && inputs.reuse_csrc_run == ''
     runs-on: ubuntu-latest
     # Keep this below GitHub-hosted runner's six-hour hard limit.
     timeout-minutes: 350
@@ -110,9 +115,6 @@ jobs:
           sudo apt-get clean
           docker system prune -af --volumes 2>/dev/null || true
           df -h /
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
 
       - name: Checkout vllm at ${{ needs.prepare.outputs.ref }}
         uses: actions/checkout@v4
@@ -210,7 +212,9 @@ jobs:
 
   package:
     needs: [prepare, build-csrc]
-    if: needs.prepare.outputs.skip != 'true'
+    if: >-
+      always() && needs.prepare.outputs.skip != 'true' &&
+      (needs.build-csrc.result == 'success' || inputs.reuse_csrc_run != '')
     runs-on: ubuntu-latest
     timeout-minutes: 350
     env:
@@ -248,64 +252,121 @@ jobs:
         with:
           name: csrc-wheel-${{ needs.prepare.outputs.cache_scope }}
           path: precompiled-wheels
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ inputs.reuse_csrc_run || github.run_id }}
 
-      - name: Use Release CMake build type and skip Machete on hosted runner
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-
-          dockerfile = Path("docker/Dockerfile")
-          text = dockerfile.read_text()
-          marker = "FROM base AS csrc-build\n"
-          injection = marker + "ENV CMAKE_BUILD_TYPE=Release\n"
-          if "ENV CMAKE_BUILD_TYPE=Release" not in text:
-              if marker not in text:
-                  raise SystemExit("csrc-build stage not found in docker/Dockerfile")
-              dockerfile.write_text(text.replace(marker, injection, 1))
-
-          cmake = Path("CMakeLists.txt")
-          text = cmake.read_text()
-          marker = '    cuda_archs_loose_intersection(MACHETE_ARCHS "9.0a" "${CUDA_ARCHS}")'
-          replacement = (
-              "    # Hosted cu129 builds skip generated Machete kernels to stay "
-              "within the runner memory limit.\n"
-              "    set(MACHETE_ARCHS)"
-          )
-          if marker not in text:
-              raise SystemExit("MACHETE_ARCHS declaration not found")
-          cmake.write_text(text.replace(marker, replacement, 1))
-
-          dockerfile = Path("docker/Dockerfile")
-          text = dockerfile.read_text()
-          old = "COPY --from=csrc-build /workspace/dist /precompiled-wheels"
-          new = "COPY precompiled-wheels /precompiled-wheels"
-          if old not in text:
-              raise SystemExit("csrc wheel COPY instruction not found")
-          dockerfile.write_text(text.replace(old, new, 1))
-          PY
-
-      - name: Build wheel via Docker using the csrc cache
+      - name: Download official cu129 wheel and merge PR native libraries
         run: |
           set -euxo pipefail
-          # The package context intentionally contains PR #38669 and the
-          # hosted-runner CMake patch, so vLLM's clean-tree check must stay
-          # disabled here. The csrc build already completed successfully.
-          docker buildx build --progress=plain --load \
-            --build-arg max_jobs=2 \
-            --build-arg nvcc_threads=1 \
-            --build-arg USE_SCCACHE=0 \
-            --build-arg GIT_REPO_CHECK=0 \
-            --build-arg CUDA_VERSION=${CUDA_VERSION} \
-            --build-arg torch_cuda_arch_list="${CUDA_ARCH_LIST}" \
-            --build-arg BUILD_OS=manylinux \
-            --build-arg BUILD_BASE_IMAGE=${BUILD_BASE_IMAGE} \
-            --tag vllm-ci:build-image \
-            --target build \
-            -f docker/Dockerfile .
-          mkdir -p artifacts
-          docker run --rm -v "$(pwd)/artifacts:/artifacts_host" vllm-ci:build-image \
-            bash -c 'cp -r dist /artifacts_host && chmod -R a+rw /artifacts_host'
-          echo "==== built wheels ===="
+          mkdir -p artifacts/dist
+          UPSTREAM_COMMIT=$(git rev-parse HEAD)
+          export UPSTREAM_COMMIT
+          METADATA_URL="https://wheels.vllm.ai/${UPSTREAM_COMMIT}/cu129/vllm/metadata.json"
+          curl --fail --location --retry 3 --retry-delay 2 "$METADATA_URL" \
+            -o /tmp/vllm-cu129-metadata.json
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          metadata_url = Path("/tmp/vllm-cu129-metadata.json")
+          entries = json.loads(metadata_url.read_text())
+          matches = [
+              entry for entry in entries
+              if entry.get("python_tag") == "cp38"
+              and entry.get("abi_tag") == "abi3"
+              and entry.get("platform_tag") == "manylinux_2_28_x86_64"
+          ]
+          if len(matches) != 1:
+              raise SystemExit(f"expected one x86_64 cp38-abi3 cu129 wheel, got {matches}")
+          entry = matches[0]
+          wheel_url = urljoin(
+              f"https://wheels.vllm.ai/{os.environ['UPSTREAM_COMMIT']}/cu129/vllm/metadata.json",
+              entry["path"],
+          )
+          Path("/tmp/vllm-cu129-wheel-url").write_text(wheel_url)
+          Path("/tmp/vllm-cu129-wheel-name").write_text(entry["filename"])
+          print(f"Official wheel: {entry['filename']}")
+          print(f"Wheel URL: {wheel_url}")
+          PY
+          OFFICIAL_NAME=$(cat /tmp/vllm-cu129-wheel-name)
+          OFFICIAL_WHEEL="/tmp/${OFFICIAL_NAME}"
+          curl --fail --location --retry 3 --retry-delay 2 \
+            "$(cat /tmp/vllm-cu129-wheel-url)" -o "$OFFICIAL_WHEEL"
+          CSRC_WHEEL=$(find precompiled-wheels -maxdepth 1 -name 'vllm-*.whl' -print -quit)
+          test -n "$CSRC_WHEEL"
+          export OFFICIAL_WHEEL CSRC_WHEEL
+          export UPSTREAM_COMMIT
+          python3 - <<'PY'
+          import base64
+          import hashlib
+          import os
+          import time
+          import zipfile
+          from pathlib import Path
+
+          official = Path(os.environ["OFFICIAL_WHEEL"])
+          csrc = Path(os.environ["CSRC_WHEEL"])
+          patched_ops = Path("vllm/_custom_ops.py").read_bytes()
+          output = Path("artifacts/dist") / official.name
+          native_paths = {
+              "vllm/_C_stable_libtorch.abi3.so",
+              "vllm/_moe_C_stable_libtorch.abi3.so",
+          }
+          with zipfile.ZipFile(csrc) as archive:
+              replacements = {path: archive.read(path) for path in native_paths}
+          if "+csrc.build.cu129-" not in csrc.name:
+              raise SystemExit(f"unexpected csrc wheel provenance: {csrc.name}")
+
+          dist_infos = []
+          with zipfile.ZipFile(official) as archive:
+              for name in archive.namelist():
+                  if name.endswith(".dist-info/METADATA"):
+                      dist_infos.append(name.split("/", 1)[0])
+          if len(dist_infos) != 1:
+              raise SystemExit(f"expected one official dist-info directory, got {dist_infos}")
+          print(f"Official dist-info: {dist_infos[0]}")
+
+          start = time.time()
+          count = 0
+          with zipfile.ZipFile(official) as source, zipfile.ZipFile(
+              output, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6
+          ) as destination:
+              for info in source.infolist():
+                  if info.filename.endswith(".dist-info/RECORD"):
+                      continue
+                  if info.filename in native_paths:
+                      data = replacements[info.filename]
+                  elif info.filename == "vllm/_custom_ops.py":
+                      data = patched_ops
+                  else:
+                      data = source.read(info.filename)
+                  destination.writestr(info, data)
+                  count += 1
+
+          with zipfile.ZipFile(output, "a", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              rows = []
+              for name in sorted(archive.namelist()):
+                  if name.endswith(".dist-info/RECORD"):
+                      continue
+                  data = archive.read(name)
+                  digest = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).decode().rstrip("=")
+                  rows.append(f"{name},sha256={digest},{len(data)}")
+              record_name = f"{dist_infos[0]}/RECORD"
+              rows.append(f"{record_name},,")
+              archive.writestr(record_name, "\n".join(rows) + "\n")
+
+          with zipfile.ZipFile(output) as archive:
+              if archive.testzip() is not None:
+                  raise SystemExit("merged wheel ZIP integrity check failed")
+              for path, expected in replacements.items():
+                  if archive.read(path) != expected:
+                      raise SystemExit(f"native replacement verification failed: {path}")
+              if archive.read("vllm/_custom_ops.py") != patched_ops:
+                  raise SystemExit("PR Python patch verification failed")
+          print(f"Merged wheel: {output} ({output.stat().st_size} bytes, {count + 1} entries, {time.time() - start:.1f}s)")
+          PY
           ls -lh artifacts/dist/
 
       - name: Tag wheel with +${{ env.VERSION_LABEL }}
@@ -315,7 +376,7 @@ jobs:
           set -euo pipefail
           WHEEL=$(ls vllm-*.whl | head -n1)
           LABEL='${{ env.VERSION_LABEL }}'
-          NEW=$(printf '%s' "$WHEEL" | sed -E "s|^(vllm-[0-9]+\.[0-9]+\.[0-9]+)-|\1+${LABEL}-|")
+          NEW=$(printf '%s' "$WHEEL" | sed -E "s|^(vllm-[0-9]+\.[0-9]+\.[0-9]+)(\+[^-]+)?-|\1+${LABEL}-|")
           mv "$WHEEL" "$NEW"
           echo "renamed=$NEW" >> "$GITHUB_OUTPUT"
           ls -lh "$NEW"
@@ -426,7 +487,7 @@ jobs:
           body: |
             vllm wheel built from upstream `${{ needs.prepare.outputs.ref }}` + PR #${{ env.PR_NUMBER }} (Marlin MoE sm_90 PTX compat fix).
 
-            Built on GitHub-hosted runners in two stages: C++/CUDA extensions are cached first, then the final wheel is packaged (CUDA ${{ env.CUDA_VERSION }}, arch list: `${{ env.CUDA_ARCH_LIST }}`).
+            The Python wheel is based on the official upstream cu129 wheel. The two Marlin native libraries are replaced with the csrc wheel built from PR #${{ env.PR_NUMBER }} (CUDA ${{ env.CUDA_VERSION }}, arch list: `${{ env.CUDA_ARCH_LIST }}`), and the PR's Python diagnostic patch is included.
 
             ## Install
 
