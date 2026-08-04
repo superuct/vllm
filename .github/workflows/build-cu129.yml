@@ -143,6 +143,23 @@ jobs:
                   raise SystemExit("csrc-build stage not found in docker/Dockerfile")
               dockerfile.write_text(text.replace(marker, injection, 1))
 
+          # Export the csrc wheel as a small, explicit cross-job artifact.
+          # The GitHub Actions cache backend is not reliable for this
+          # multi-gigabyte BuildKit graph, while the wheel itself is enough
+          # for the package stage's precompiled-extension path.
+          dockerfile = Path("docker/Dockerfile")
+          text = dockerfile.read_text()
+          marker = "FROM base AS extensions-build\n"
+          injection = (
+              "FROM scratch AS csrc-wheel-artifact\n"
+              "COPY --from=csrc-build /workspace/dist/ /\n\n"
+              + marker
+          )
+          if "FROM scratch AS csrc-wheel-artifact" not in text:
+              if marker not in text:
+                  raise SystemExit("extensions-build stage not found in docker/Dockerfile")
+              dockerfile.write_text(text.replace(marker, injection, 1))
+
           # Machete's generated Hopper dispatch translation unit is the first
           # template-heavy CUDA target on the 4-core/16-GB hosted runner. It
           # repeatedly receives SIGTERM around [37/421] before the csrc cache
@@ -159,17 +176,17 @@ jobs:
           if marker not in text:
               raise SystemExit("MACHETE_ARCHS declaration not found")
           cmake.write_text(text.replace(marker, replacement, 1))
+
           PY
 
-      - name: Build C++/CUDA extension wheel and export cache
+      - name: Build C++/CUDA extension wheel and export artifact
         run: |
           set -euxo pipefail
           # Keep two nvcc processes on the 4-core/16-GB hosted runner. Three
           # concurrent template-heavy nvcc jobs lost runner communication;
           # the previous two-way build reached wheel creation in about 5h06m.
+          mkdir -p artifacts/csrc-wheel
           docker buildx build --progress=plain \
-            --cache-from "type=gha,scope=${CACHE_SCOPE}-csrc" \
-            --cache-to "type=gha,scope=${CACHE_SCOPE}-csrc,mode=min" \
             --build-arg max_jobs=2 \
             --build-arg nvcc_threads=1 \
             --build-arg USE_SCCACHE=0 \
@@ -177,9 +194,19 @@ jobs:
             --build-arg torch_cuda_arch_list="${CUDA_ARCH_LIST}" \
             --build-arg BUILD_OS=manylinux \
             --build-arg BUILD_BASE_IMAGE=${BUILD_BASE_IMAGE} \
-            --target csrc-build \
-            --tag vllm-ci:csrc \
+            --target csrc-wheel-artifact \
+            --output "type=local,dest=artifacts/csrc-wheel" \
             -f docker/Dockerfile .
+          test "$(find artifacts/csrc-wheel -maxdepth 1 -name 'vllm-*.whl' | wc -l)" -eq 1
+          ls -lh artifacts/csrc-wheel
+
+      - name: Upload csrc wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: csrc-wheel-${{ needs.prepare.outputs.cache_scope }}
+          path: artifacts/csrc-wheel/vllm-*.whl
+          if-no-files-found: error
+          retention-days: 2
 
   package:
     needs: [prepare, build-csrc]
@@ -216,6 +243,12 @@ jobs:
           git apply --verbose /tmp/pr.patch
           git status --short
 
+      - name: Download csrc wheel artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: csrc-wheel-${{ needs.prepare.outputs.cache_scope }}
+          path: precompiled-wheels
+
       - name: Use Release CMake build type and skip Machete on hosted runner
         run: |
           python3 - <<'PY'
@@ -241,6 +274,14 @@ jobs:
           if marker not in text:
               raise SystemExit("MACHETE_ARCHS declaration not found")
           cmake.write_text(text.replace(marker, replacement, 1))
+
+          dockerfile = Path("docker/Dockerfile")
+          text = dockerfile.read_text()
+          old = "COPY --from=csrc-build /workspace/dist /precompiled-wheels"
+          new = "COPY precompiled-wheels /precompiled-wheels"
+          if old not in text:
+              raise SystemExit("csrc wheel COPY instruction not found")
+          dockerfile.write_text(text.replace(old, new, 1))
           PY
 
       - name: Build wheel via Docker using the csrc cache
@@ -250,9 +291,6 @@ jobs:
           # hosted-runner CMake patch, so vLLM's clean-tree check must stay
           # disabled here. The csrc build already completed successfully.
           docker buildx build --progress=plain --load \
-            --cache-from "type=gha,scope=${CACHE_SCOPE}-csrc" \
-            --cache-from "type=gha,scope=${CACHE_SCOPE}-package" \
-            --cache-to "type=gha,scope=${CACHE_SCOPE}-package,mode=max" \
             --build-arg max_jobs=2 \
             --build-arg nvcc_threads=1 \
             --build-arg USE_SCCACHE=0 \
