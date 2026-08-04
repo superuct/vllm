@@ -116,6 +116,9 @@ jobs:
           docker system prune -af --volumes 2>/dev/null || true
           df -h /
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Checkout vllm at ${{ needs.prepare.outputs.ref }}
         uses: actions/checkout@v4
         with:
@@ -228,9 +231,6 @@ jobs:
           sudo apt-get clean
           docker system prune -af --volumes 2>/dev/null || true
           df -h /
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
 
       - name: Checkout vllm at ${{ needs.prepare.outputs.ref }}
         uses: actions/checkout@v4
