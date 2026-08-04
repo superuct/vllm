@@ -246,6 +246,9 @@ jobs:
       - name: Build wheel via Docker using the csrc cache
         run: |
           set -euxo pipefail
+          # The package context intentionally contains PR #38669 and the
+          # hosted-runner CMake patch, so vLLM's clean-tree check must stay
+          # disabled here. The csrc build already completed successfully.
           docker buildx build --progress=plain --load \
             --cache-from "type=gha,scope=${CACHE_SCOPE}-csrc" \
             --cache-from "type=gha,scope=${CACHE_SCOPE}-package" \
@@ -253,7 +256,7 @@ jobs:
             --build-arg max_jobs=2 \
             --build-arg nvcc_threads=1 \
             --build-arg USE_SCCACHE=0 \
-            --build-arg GIT_REPO_CHECK=1 \
+            --build-arg GIT_REPO_CHECK=0 \
             --build-arg CUDA_VERSION=${CUDA_VERSION} \
             --build-arg torch_cuda_arch_list="${CUDA_ARCH_LIST}" \
             --build-arg BUILD_OS=manylinux \
