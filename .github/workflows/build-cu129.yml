@@ -5,7 +5,7 @@ name: Build cu129 wheel
 
 on:
   schedule:
-    - cron: '23 6 * * *'  # 每天 06:23 UTC
+    - cron: '0 22 * * *'  # 每天北京时间 06:00（UTC 前一天 22:00）
   workflow_dispatch:
     inputs:
       ref:
