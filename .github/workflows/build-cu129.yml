@@ -32,7 +32,11 @@ permissions:
 env:
   CUDA_ARCH_LIST: ${{ inputs.arch_list || '9.0' }}
   PR_NUMBER: "38669"
-  VERSION_LABEL: "cu129-marlin-fix"
+  # Wheel version components cannot contain hyphens because wheel filenames
+  # use hyphens as field separators. Keep the GitHub Release tag readable,
+  # but normalize the local version embedded in the wheel.
+  WHEEL_VERSION_LABEL: "cu129.marlin.fix"
+  RELEASE_LABEL: "cu129-marlin-fix"
   CUDA_VERSION: "12.9.1"
   BUILD_BASE_IMAGE: "pytorch/manylinux2_28-builder:cuda12.9"
 
@@ -79,7 +83,7 @@ jobs:
           REF='${{ steps.resolve_ref.outputs.ref }}'
           FORCE='${{ inputs.force || 'false' }}'
           VER="${REF#v}"
-          TAG="vllm-v${VER}+${VERSION_LABEL}"
+          TAG="vllm-v${VER}+${RELEASE_LABEL}"
           if [ "$FORCE" = "true" ]; then
             echo "Force rebuild requested"
             echo "skip=false" >> "$GITHUB_OUTPUT"
@@ -369,13 +373,13 @@ jobs:
           PY
           ls -lh artifacts/dist/
 
-      - name: Tag wheel with +${{ env.VERSION_LABEL }}
+      - name: Tag wheel with +${{ env.WHEEL_VERSION_LABEL }}
         id: rename
         working-directory: artifacts/dist
         run: |
           set -euo pipefail
           WHEEL=$(ls vllm-*.whl | head -n1)
-          LABEL='${{ env.VERSION_LABEL }}'
+          LABEL='${{ env.WHEEL_VERSION_LABEL }}'
           NEW=$(printf '%s' "$WHEEL" | sed -E "s|^(vllm-[0-9]+\.[0-9]+\.[0-9]+)(\+[^-]+)?-|\1+${LABEL}-|")
           mv "$WHEEL" "$NEW"
           echo "renamed=$NEW" >> "$GITHUB_OUTPUT"
@@ -386,7 +390,7 @@ jobs:
         working-directory: artifacts/dist
         env:
           WHEEL: ${{ steps.rename.outputs.renamed }}
-          LABEL: ${{ env.VERSION_LABEL }}
+          LABEL: ${{ env.WHEEL_VERSION_LABEL }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -395,6 +399,8 @@ jobs:
           import os
           import re
           import shutil
+          import subprocess
+          import sys
           import tempfile
           import zipfile
           from pathlib import Path
@@ -467,6 +473,19 @@ jobs:
                   metadata = archive.read(metadata_name).decode()
                   if f"Version: {new_version}" not in metadata:
                       raise SystemExit("normalized METADATA version check failed")
+          subprocess.run(
+              [
+                  sys.executable,
+                  "-m",
+                  "pip",
+                  "install",
+                  "--disable-pip-version-check",
+                  "--dry-run",
+                  "--no-deps",
+                  str(final_path),
+              ],
+              check=True,
+          )
           with open(os.environ["GITHUB_OUTPUT"], "a") as output_file:
               output_file.write(f"wheel={final_path.name}\n")
           PY
@@ -482,7 +501,7 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: vllm-v${{ steps.ver.outputs.version }}
+          tag_name: vllm-${{ needs.prepare.outputs.ref }}+${{ env.RELEASE_LABEL }}
           name: vllm ${{ steps.ver.outputs.version }}
           body: |
             vllm wheel built from upstream `${{ needs.prepare.outputs.ref }}` + PR #${{ env.PR_NUMBER }} (Marlin MoE sm_90 PTX compat fix).
@@ -498,4 +517,5 @@ jobs:
             Use `--no-deps` to preserve your existing CUDA 12.9 vllm deps (torch, etc.).
           files: artifacts/dist/${{ steps.metadata.outputs.wheel }}
           fail_on_unmatched_files: true
+          overwrite_files: true
           make_latest: false
