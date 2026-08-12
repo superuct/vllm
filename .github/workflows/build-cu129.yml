@@ -499,23 +499,35 @@ jobs:
           echo "Resolved version: $V"
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: vllm-${{ needs.prepare.outputs.ref }}+${{ env.RELEASE_LABEL }}
-          name: vllm ${{ steps.ver.outputs.version }}
-          body: |
-            vllm wheel built from upstream `${{ needs.prepare.outputs.ref }}` + PR #${{ env.PR_NUMBER }} (Marlin MoE sm_90 PTX compat fix).
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: vllm-${{ needs.prepare.outputs.ref }}+${{ env.RELEASE_LABEL }}
+          TITLE: vllm ${{ steps.ver.outputs.version }}
+          WHEEL: artifacts/dist/${{ steps.metadata.outputs.wheel }}
+          TARGET: ${{ needs.prepare.outputs.ref }}
+        run: |
+          set -euo pipefail
+          test -f "$WHEEL"
+          cat > release-notes.md <<'EOF'
+          vllm wheel built from upstream `${{ needs.prepare.outputs.ref }}` + PR #${{ env.PR_NUMBER }} (Marlin MoE sm_90 PTX compat fix).
 
-            The Python wheel is based on the official upstream cu129 wheel. The two Marlin native libraries are replaced with the csrc wheel built from PR #${{ env.PR_NUMBER }} (CUDA ${{ env.CUDA_VERSION }}, arch list: `${{ env.CUDA_ARCH_LIST }}`), and the PR's Python diagnostic patch is included.
+          The Python wheel is based on the official upstream cu129 wheel. The two Marlin native libraries are replaced with the csrc wheel built from PR #${{ env.PR_NUMBER }} (CUDA ${{ env.CUDA_VERSION }}, arch list: `${{ env.CUDA_ARCH_LIST }}`), and the PR's Python diagnostic patch is included.
 
-            ## Install
+          ## Install
 
-            ```bash
-            pip install --no-deps --force-reinstall <WHEEL_URL>
-            ```
+          ```bash
+          pip install --no-deps --force-reinstall <WHEEL_URL>
+          ```
 
-            Use `--no-deps` to preserve your existing CUDA 12.9 vllm deps (torch, etc.).
-          files: artifacts/dist/${{ steps.metadata.outputs.wheel }}
-          fail_on_unmatched_files: true
-          overwrite_files: true
-          make_latest: false
+          Use `--no-deps` to preserve your existing CUDA 12.9 vllm deps (torch, etc.).
+          EOF
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$WHEEL" --clobber
+            gh release edit "$TAG" --title "$TITLE" --notes-file release-notes.md
+          else
+            gh release create "$TAG" "$WHEEL" \
+              --target "$TARGET" \
+              --title "$TITLE" \
+              --notes-file release-notes.md \
+              --latest=false
+          fi
