@@ -504,7 +504,10 @@ jobs:
           TAG: vllm-${{ needs.prepare.outputs.ref }}+${{ env.RELEASE_LABEL }}
           TITLE: vllm ${{ steps.ver.outputs.version }}
           WHEEL: artifacts/dist/${{ steps.metadata.outputs.wheel }}
-          TARGET: ${{ needs.prepare.outputs.ref }}
+          # The upstream tag is not guaranteed to exist in this fork. The
+          # release tag must therefore target the workflow's fork commit;
+          # the Release notes retain the upstream ref used for the wheel.
+          TARGET: ${{ github.sha }}
         run: |
           set -euo pipefail
           test -f "$WHEEL"
