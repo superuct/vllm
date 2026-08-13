@@ -521,11 +521,12 @@ jobs:
 
           Use `--no-deps` to preserve your existing CUDA 12.9 vllm deps (torch, etc.).
           EOF
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" "$WHEEL" --clobber
-            gh release edit "$TAG" --title "$TITLE" --notes-file release-notes.md
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$WHEEL" --clobber --repo "$GITHUB_REPOSITORY"
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TITLE" --notes-file release-notes.md
           else
             gh release create "$TAG" "$WHEEL" \
+              --repo "$GITHUB_REPOSITORY" \
               --target "$TARGET" \
               --title "$TITLE" \
               --notes-file release-notes.md \
